@@ -1,7 +1,13 @@
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "officehours.db"
+if os.environ.get("DB_PATH"):
+    DB_PATH = Path(os.environ["DB_PATH"])
+elif os.environ.get("VERCEL"):
+    DB_PATH = Path("/tmp/officehours.db")
+else:
+    DB_PATH = Path(__file__).resolve().parent / "data" / "officehours.db"
 
 
 def get_db():
