@@ -1,8 +1,21 @@
+import hashlib
 import os
 import secrets
+import time
 from functools import wraps
 
-from flask import Flask, abort, flash, g, redirect, render_template, request, url_for
+from flask import (
+    Flask,
+    abort,
+    flash,
+    g,
+    make_response,
+    redirect,
+    render_template,
+    render_template_string,
+    request,
+    url_for,
+)
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from db import get_db, init_db
@@ -10,9 +23,11 @@ from seed import seed
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "officehours-dev-secret")
-app.config["SESSION_COOKIE_HTTPONLY"] = False
-app.config["SESSION_COOKIE_SAMESITE"] = None
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_NAME"] = "hold_flash"
+#This makes it so the token only lasts for 5 minutes rather than an infinite amount of time
+HANDOFF_TOKEN_TTL_SECONDS = 5 * 60
 
 
 def current_user():
@@ -34,7 +49,7 @@ def login_required(fn):
 def load_user():
     init_db()
     seed()
-    token = request.args.get("sid") or request.cookies.get("hold_session")
+    token = request.cookies.get("hold_session")
     g.user = None
     g.session_token = None
     if not token:
@@ -56,12 +71,14 @@ def load_user():
 
 @app.after_request
 def persist_session_cookie(response):
+    response.headers["Referrer-Policy"] = "no-referrer"
     if g.get("session_token"):
         response.set_cookie(
             "hold_session",
             g.session_token,
-            httponly=False,
-            samesite=None,
+            httponly=True,
+            secure=request.is_secure or bool(os.environ.get("VERCEL")),
+            samesite="Lax",
             path="/",
             max_age=60 * 60 * 24 * 14,
         )
@@ -80,6 +97,97 @@ def create_session(user_id):
     conn.commit()
     conn.close()
     return token
+
+#This whole section is added to make the device handoff feature more secure
+#This function creates expiring, one-time handoff tokens and will redeem them only after password confirmation
+def create_handoff_token(user_id):
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    conn = get_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS handoff_tokens (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            expires_at INTEGER NOT NULL
+        )
+        """
+    )
+    now = int(time.time())
+    expires_at = now + HANDOFF_TOKEN_TTL_SECONDS
+    conn.execute("DELETE FROM handoff_tokens WHERE expires_at <= ?", (now,))
+    conn.execute(
+        "INSERT INTO handoff_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+        (token_hash, user_id, expires_at),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+#This function verifies the handoff token and password, then consumes it to create a new session
+def redeem_handoff(token):
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = int(time.time())
+    conn = get_db()
+    user = conn.execute(
+        """
+        SELECT users.* FROM handoff_tokens
+        JOIN users ON users.id = handoff_tokens.user_id
+        WHERE handoff_tokens.token_hash = ? AND handoff_tokens.expires_at > ?
+        """,
+        (token_hash, now),
+    ).fetchone()
+    conn.close()
+    if not user:
+        flash("This handoff link is invalid or has expired. Sign in to continue.")
+        return redirect(url_for("login"))
+
+    error = None
+    if request.method == "POST":
+        password = request.form.get("password") or ""
+        if not check_password_hash(user["password_hash"], password):
+            error = "That password did not match this account."
+        else:
+            conn = get_db()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT user_id FROM handoff_tokens WHERE token_hash = ? AND expires_at > ?",
+                    (token_hash, int(time.time())),
+                ).fetchone()
+                if not row or row["user_id"] != user["id"]:
+                    conn.rollback()
+                    flash("This handoff link is invalid or has expired. Sign in to continue.")
+                    return redirect(url_for("login"))
+                conn.execute("DELETE FROM handoff_tokens WHERE token_hash = ?", (token_hash,))
+                session_token = secrets.token_hex(24)
+                conn.execute(
+                    "INSERT INTO sessions (token, user_id) VALUES (?, ?)",
+                    (session_token, user["id"]),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            g.session_token = session_token
+            return redirect(url_for("mine"))
+
+    response = make_response(
+        render_template_string(
+            """<!doctype html>
+            <title>Confirm device handoff</title>
+            <h1>Confirm device handoff</h1>
+            <p>Enter your account password to open your bookings on this browser.</p>
+            {% if error %}<p>{{ error }}</p>{% endif %}
+            <form method="post">
+              <label>Password <input type="password" name="password" required autofocus></label>
+              <button type="submit">Continue</button>
+            </form>""",
+            error=error,
+        )
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/health")
@@ -225,9 +333,15 @@ def book_slot(slot_id):
     return redirect(url_for("mine"))
 
 
-@app.get("/me")
-@login_required
+@app.route("/me", methods=["GET", "POST"])
 def mine():
+    #This part checks the sid, and the redirection to the login page
+    if request.args.get("sid"):
+        return redeem_handoff(request.args["sid"])
+    if not current_user():
+        flash("Sign in to continue.")
+        return redirect(url_for("login"))
+
     conn = get_db()
     if current_user()["role"] == "ta":
         slots = conn.execute(
@@ -260,7 +374,15 @@ def mine():
         (current_user()["id"],),
     ).fetchall()
     conn.close()
-    return render_template("mine.html", bookings=bookings, sid=g.session_token)
+    response = make_response(
+        render_template(
+            "mine.html",
+            bookings=bookings,
+            sid=create_handoff_token(current_user()["id"]),
+        )
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/bookings/<int:booking_id>")
